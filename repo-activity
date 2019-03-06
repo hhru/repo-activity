@@ -1,0 +1,132 @@
+#!/usr/bin/perl -w
+use strict;
+use feature qw/say/;
+use IPC::Open2;
+use Data::Dumper;
+BEGIN {push @INC, $0=~s%/[^/]+$%/lib%r}
+
+use mk::opts {
+	since=>{
+		getopt=>"since=s",
+		desc=>"Начинать с коммита или даты, в формате git, например \@{5.days.ago}",
+		value=>'@{15.days.ago}',
+	},
+	include=>{
+		getopt=>"include=s@",
+		desc=>"Учитывать только файлы, попадающие под regexp",
+		value=>['/src/main/java/.*\.java'],
+	},
+	exclude=>{
+		getopt=>"exclude=s@",
+		desc=>"Не учитывать файлы, попадающие под regexp",
+		value=>[],
+	},
+	splitmodule=>{
+		getopt=>"splitmodule=s",
+		value=>"/src/main/java/",
+		desc=>"Строка для разделения модуля и пакета",
+	},
+	format=>{
+		getopt=>"format=s",
+		value=>"%-10s %-10s %s\n",
+	},
+	shift=>{
+		desc=>"Заменять предыдущую часть на отступы",
+	},
+	nogroup=>{
+		desc=>"Не группировать по родительским директориям",
+	},
+	wcommit=>{
+		desc=>"Вес коммита для сортировки",
+		value=>100,
+	},
+	wchange=>{
+		desc=>"Вес изменения для сортировки",
+		value=>1,
+	},
+	debug=>{
+		desc=>"Отладочный режим",
+	},
+	maxdepth=>{
+		getopt=>"maxdepth=i",
+		desc=>"Скрывать записи с уровнем вложенности более N",
+	},
+	chdir=>{
+		getopt=>"chdir=s",
+		desc=>"Директория с проектом, если отличается от текущей",
+	},
+};
+
+sub debug($@) {
+	return unless mk::opts::DEBUG;
+	say STDERR join " ", @_;
+}
+if (defined mk::opts::CHDIR) {chdir mk::opts::CHDIR or die "chdir: $!"}
+
+open2(\*GIT, undef, qw/git log -1 --format=%H --before/, mk::opts::SINCE) or die "can't start git: $!";
+my $commitid=<GIT>;
+chomp $commitid;
+close GIT;
+debug "starting at commit", $commitid;
+
+open2(\*GIT, undef, qw/git log --numstat/, $commitid."..") or die "can't start git: $!";
+
+my %diff;
+my %count;
+while (<GIT>) {
+	chomp;
+	m%^(\d+)\s+(\d+)\s+(.*)% or next;
+	my ($added, $deleted, $file)=($1, $2, $3);
+
+	next if grep {$file !~ $_} @{+mk::opts::INCLUDE};
+	next if grep {$file=~$_} @{+mk::opts::EXCLUDE};
+
+	my ($module, $package)=split mk::opts::SPLITMODULE, $file;
+	my $key="$module:$package";
+	$diff{$key} += $added+$deleted;
+	$count{$key}++;
+}
+close GIT;
+
+my %child;
+unless (mk::opts::NOGROUP) {
+	for my $key (sort keys %diff) {
+		my $group=$key;
+		my $prev=$key;
+		while ($group=~s%/[^/]*$%%) {
+			$child{$group}->{$prev}++;
+			$diff{$group} += $diff{$key};
+			$count{$group}++;
+			$prev=$group;
+		}
+	}
+}
+
+sub weight($) {
+	local $_=shift;
+	return ($diff{$_} // 0)*mk::opts::WCHANGE+($count{$_} // 0)*mk::opts::WCOMMIT+-0.001*length $_;
+}
+
+sub weighted($$) {
+	return weight $_[1] <=> weight $_[0];
+}
+printf mk::opts::FORMAT, qw/commits changes module:package/;
+for (sort weighted keys %diff) {
+	dump_entry($_);
+}
+
+sub dump_entry {
+	my $entry=shift;
+	my $shift=shift // 0;
+	return unless $diff{$entry};
+
+	return if mk::opts::MAXDEPTH and (()=$entry=~m%/%g)>mk::opts::MAXDEPTH;
+	my $label=$entry;
+	substr $label, 0, $shift, " " x $shift if mk::opts::SHIFT;
+	printf mk::opts::FORMAT, $count{$entry}, $diff{$entry}, $label;
+
+	for (sort weighted keys %{$child{$entry}}) {
+		dump_entry($_, length $entry);
+	}
+	delete $diff{$entry};
+}
